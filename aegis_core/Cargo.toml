@@ -1,0 +1,34 @@
+# aegis_core — núcleo de decisión de AegisRuntime.
+#
+# [WHY] crate-type = ["cdylib", "rlib"]:
+#   - cdylib: el trap layer de C la carga vía LD_PRELOAD y la enlaza por
+#     símbolo (aegis_analyze_and_heal), sin linkeo en build-time.
+#   - rlib: permite `cargo test` sobre el fast-path (tests unitarios del
+#     decodificador), algo que un cdylib puro no expone.
+#
+# [SEC] panic = "abort": un panic dentro de un signal handler no debe
+# intentar unwinding (¡reentraría en el stack del hilo roto!). Abortar con un
+# mensaje es la única salida defendible, y solo ocurre si hay un bug NOSOTROS.
+
+[package]
+name = "aegis_core"
+version = "0.1.0"
+edition = "2021"
+description = "Núcleo heurístico de AegisRuntime (autocuración de binarios)"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1
+opt-level = 3
+
+[dependencies]
+# [NOTE] Intencionalmente CERO dependencias en Fase 1: el fast-path debe ser
+# auditable y async-signal-safe. Cuando se integre Zydis (Fase 2), se hará por
+# FFI estático con la feature "zydis" detrás de un cfg, preservando este
+# camino sin allocs.

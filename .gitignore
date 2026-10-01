@@ -1,0 +1,31 @@
+# --- Compilación ---------------------------------------------------------
+build/
+aegis_core/target/
+*.o
+*.so
+*.a
+*.d
+
+# --- Demos compiladas (el .c SÍ se versiona; el binario no) ---------------
+build/bin/
+
+# --- Entorno -------------------------------------------------------------
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# --- Editores / SO -------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+.DS_Store
+*~
+
+# --- Credenciales --------------------------------------------------------
+# NUNCA deben subirse. Si alguna vez aparece un token en un fichero versionado,
+# es una fuga de seguridad: revócalo y muévelo a una variable de entorno.
+*.token
+.env
+.env.*
+.netrc
