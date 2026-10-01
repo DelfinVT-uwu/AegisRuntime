@@ -1,233 +1,230 @@
 # AegisRuntime
 
-**Runtime de resiliencia que cura fallos de CPU en procesos reales, sin recompilarlos.**
+**A resilience runtime that heals CPU faults in real processes, without recompiling them.**
 
-Cuando un programa recibe un `SIGFPE` (división por cero) o un `SIGSEGV` (acceso
-inválido a memoria), normalmente el kernel lo mata y se acabó: core dump, pérdida
-de datos, downtime. AegisRuntime se inyecta en el proceso mediante `LD_PRELOAD`,
-intercepta la señal **antes** de que el kernel mate nada, diagnostica la causa, la
-**repara** y reanuda la ejecución.
+When a program receives a `SIGFPE` (division by zero) or a `SIGSEGV` (invalid memory
+access), the kernel normally kills it and that's that: core dump, lost data, downtime.
+AegisRuntime is injected into the process via `LD_PRELOAD`, intercepts the signal
+**before** the kernel kills anything, diagnoses the cause, **repairs** it, and
+resumes execution.
 
+```console
+$ ./build/bin/aegis run ./realmem3 100 0
+total=100
+
+── report ───────────────────────────────────────────────
+  healed  : 1 event(s)
+  --------------------------------------------------------------------
+  SIGFPE   rip=0x561f0c1031f1 action=patchmem rule=div-mem: divisor forced to 1 in RAM + re-execution
 ```
-$ ./aegis run ./mi_programa 100 0
-total=100                          # el programa sigue y da un resultado útil
 
-  ── informe ────────────────────────────────────
-    curados  : 1 evento(s)
-    ────────────────────────────────────────────
-    SIGFPE   action=patchmem rule=div-mem: divisor forzado a 1 en RAM + re-ejecucion
-```
-
-Sin Aegis, ese mismo programa moría con `rc=136` (128 + 8 = SIGFPE).
+Without Aegis, that same program died with `rc=136` (128 + 8 = SIGFPE).
 
 ---
 
-## ¿En qué se diferencia?
+## What makes it different
 
-| Herramienta | Qué hace ante un fallo |
+| Tool | What it does on a fault |
 |---|---|
-| **Wireshark** (`epan/except.c`) | `siglongjmp`: **abandona** la instrucción que falló |
-| **DynamoRIO** (`dr_register_exception_event`) | **abandona** la instrucción que falló |
-| **AegisRuntime** | **repara** el estado y **re-ejecuta** la instrucción |
+| **Wireshark** (`epan/except.c`) | `siglongjmp`: **abandons** the faulting instruction |
+| **DynamoRIO** (`dr_register_exception_event`) | **abandons** the faulting instruction |
+| **AegisRuntime** | **repairs** the state and **re-executes** the instruction |
 
-Las herramientas existentes hacen que el programa *sobreviva* saltándose el error.
-Aegis lo hace **calculando el resultado correcto**: si divides por cero, reescribe
-el divisor y te da el cociente real. En `100 / 0` devuelve `100`, no un cero
-inventado ni un salto silencioso.
+Existing tools keep the program *alive* by stepping over the error. Aegis does it by
+**computing the correct result**: if you divide by zero, it rewrites the divisor and
+gives you the real quotient. For `100 / 0` it returns `100` — not an invented zero
+and not a silent skip.
 
 ---
 
-## Cómo funciona
+## How it works
 
-Cada lenguaje está donde el peligro es real. La regla: **donde hay lógica hay
-seguridad de memoria** (Rust), y **donde el kernel te llama hay C mínimo**.
+Each language lives where the danger is. The rule: **where there is logic there is
+memory safety** (Rust), and **where the kernel calls you there is minimal C**.
 
-| Capa | Lenguaje | Responsabilidad |
+| Layer | Language | Responsibility |
 |---|---|---|
-| `aegis_injector` | **Nim** | CLI: lanza el proceso, recoge la telemetría. No decide curas. |
-| `aegis_sys` | **C23 + ASM** | Handler de señal, `ucontext_t`, validación de memoria. Lo que invoca el kernel. |
-| `aegis_core` | **Rust `no_std`** | Decodifica la instrucción, decide la acción, firma anti-bucle. |
+| `aegis_injector` | **Nim** | CLI: launches the process, collects telemetry. Decides no cures. |
+| `aegis_sys` | **C23 + ASM** | Signal handler, `ucontext_t`, memory validation. What the kernel invokes. |
+| `aegis_core` | **Rust `no_std`** | Decodes the instruction, decides the action, anti-loop signature. |
 
-### El flujo de una curación
+### The flow of a heal
 
 ```
-Fallo de CPU → kernel → sigaltstack → aegis_trap_handler (C23)
+CPU fault → kernel → sigaltstack → aegis_trap_handler (C23)
    │
-   ├─ 1. Copia gregs[] (23×u64) + RIP + los BYTES de la instrucción → frame_in
-   ├─ 2. dlsym cacheado → aegis_analyze_and_heal(&in, &out)   [Rust]
-   │        ├─ fastpath: decodifica la instrucción en RIP (x86-64)
-   │        ├─ engine:   decide la acción (parche / saltar / abortar)
-   │        ├─ signature: hash de (RIP, señal) → contador anti-bucle
-   │        └─ telemetry: ring buffer lock-free
-   ├─ 3. C VALIDA y APLICA las mutaciones (nunca Rust directamente)
-   └─ 4. return → sigreturn → la instrucción se re-ejecuta con el estado reparado
+   ├─ 1. Copy gregs[] (23×u64) + RIP + the instruction BYTES → frame_in
+   ├─ 2. cached dlsym → aegis_analyze_and_heal(&in, &out)   [Rust]
+   │        ├─ fastpath: decode the instruction at RIP (x86-64)
+   │        ├─ engine:   decide the action (patch / skip / abort)
+   │        ├─ signature: hash of (RIP, signal) → anti-loop counter
+   │        └─ telemetry: lock-free ring buffer
+   ├─ 3. C VALIDATES and APPLIES the mutations (never Rust directly)
+   └─ 4. return → sigreturn → the instruction re-executes with repaired state
 ```
 
-### Las tres ideas del diseño
+### The three design ideas
 
-**1. El motor no toca memoria. Ni la desreferencia, ni la lee.**
-C copia el prefijo legible de la instrucción (hasta 15 bytes, o hasta donde acabe
-la página) y Rust decodifica **sobre esa copia**. Así Rust no tiene un solo `unsafe`
-de acceso a memoria, que es exactamente donde no queremos estar dentro de un
-handler de señal. Antes de esto el motor hacía `slice::from_raw_parts(rip, 15)` y se
-colgaba solo si RIP no era legible.
+**1. The engine never touches memory. It neither dereferences nor reads it.**
+C copies the legible prefix of the instruction (up to 15 bytes, or up to the end of
+the page) and Rust decodes **on that copy**. Rust therefore has not a single `unsafe`
+memory access — which is exactly where you don't want to be inside a signal handler.
+Before this, the engine used `slice::from_raw_parts(rip, 15)` and would hang by itself
+when RIP was unreadable.
 
-**2. Separar "calcular la dirección" de "escribir en ella".**
-Rust devuelve un `MemWrite { addr, val, size }`: Rust **calcula** la dirección,
-C la **valida** (tamaño ∈ {1,2,4,8}, página escribible según `/proc/self/maps`) y
-**escribe** exactamente ese tamaño. Nadie desreferencia por su cuenta: si la
-dirección no es resoluble, degrada a `skip` en vez de inventarla — **fallo cerrado**.
+**2. Separating "compute the address" from "write to it".**
+Rust returns a `MemWrite { addr, val, size }`: Rust **computes** the address, C
+**validates** it (size ∈ {1,2,4,8}, writable page according to `/proc/self/maps`) and
+**writes** exactly that size. Nobody dereferences on their own: if the address is not
+resolvable, it degrades to `skip` rather than inventing one — **fail closed**.
 
-**3. Cero decisiones duplicadas.**
-El inyector en Nim no reimplementa la heurística: hay una sola fuente de verdad
-(el motor en Rust). Añadir una regla no obliga a tocar tres sitios.
+**3. Zero duplicated decisions.**
+The Nim injector does not reimplement the heuristic: there is a single source of truth
+(the Rust engine). Adding a rule means touching one place, not three.
 
-### La cura `PatchMem`: el divisor vive en RAM
+### The `PatchMem` cure: the divisor lives in RAM
 
-Este es el caso difícil y el más frecuente en software compilado a `-O2`. GCC
-optimiza el divisor a un **stack spill**, así que la instrucción que falla es algo
-como `idivq -0x8(%rsp)` — el divisor **no está en ningún registro**, sino en
-memoria. No hay registro que parchear.
+This is the hard case and the most common one in software compiled at `-O2`. GCC
+optimizes the divisor into a **stack spill**, so the instruction that faults looks
+like `idivq -0x8(%rsp)` — the divisor **is not in any register**, it's in memory.
+There is no register to patch.
 
-Aegis entonces:
-1. Decodifica el ModRM y el SIB para resolver la **dirección efectiva** del divisor
-   (`base + index×scale + disp`, RIP-relativo, `rbp+disp8`, …).
-2. Comprueba que la dirección es válida y escribible.
-3. Escribe `1` en esa posición de memoria.
-4. **Re-ejecuta** la misma instrucción → el cociente sale correcto.
+Aegis then:
+1. Decodes the ModRM and SIB byte to resolve the divisor's **effective address**
+   (`base + index×scale + disp`, RIP-relative, `rbp+disp8`, …).
+2. Checks that the address is valid and writable.
+3. Writes `1` at that memory location.
+4. **Re-executes** the same instruction → the quotient comes out correct.
 
 ```
-idiv REAL en offset 0x11f1  ->  48 f7 7c 24 f8   idivq  -0x8(%rsp)
-dirección efectiva del divisor = 0x7fffffffe390
-valor del divisor EN MEMORIA  = 0   <-- cero => #DE
+real idiv at offset 0x11f1  ->  48 f7 7c 24 f8   idivq  -0x8(%rsp)
+divisor effective address = 0x7fffffffe390
+divisor value IN MEMORY   = 0   <-- zero => #DE
 ```
 
-### Seguridad
+### Safety
 
-- **Fallo cerrado.** Si algo no cuadra, Aegis no improvisa: devuelve `skip` o deja
-  morir al proceso. Nunca inventa una dirección ni un valor.
-- **Anti-bucle.** Si la misma `(RIP, señal)` falla muchas veces en 1 segundo, aborta
-  con core dump controlado en vez de parchear en bucle infinito.
-- **Sin `malloc` en el handler.** Toda la memoria (alt-stack, shadow page, code
-  cave, ring de telemetría) se reserva en el constructor con `mmap`, antes del
-  primer trap.
-- **No desactiva ASLR ni elude Yama.** Son decisiones de seguridad del proceso
-  objetivo; toolkits que las sortean no tienen nada que enseñar aquí.
+- **Fail closed.** If anything doesn't add up, Aegis does not improvise: it returns
+  `skip` or lets the process die. It never invents an address or a value.
+- **Anti-loop.** If the same `(RIP, signal)` faults many times within 1 second, it
+  aborts with a controlled core dump instead of patching in an infinite loop.
+- **No `malloc` in the handler.** All memory (alt-stack, shadow page, code cave,
+  telemetry ring) is reserved in the constructor with `mmap`, before the first trap.
+- **Does not disable ASLR or evade Yama.** Those are the target process's own
+  security decisions; toolkits that bypass them have nothing to teach here.
 
 ---
 
-## Compilar
+## Building
 
-Requisitos: **gcc/clang** (C23), **cargo**, **nim**, y opcionalmente Capstone.
+Requirements: **gcc/clang** (C23), **cargo**, **nim**, and optionally Capstone.
 
 ```bash
-make all       # las dos .so (esto es el producto)
-make demos     # binarios de prueba, que fallan A PROPÓSITO
-make cli       # el binario `aegis` (Nim)
-make test      # suite de tests
+make all       # the two .so files (this is the product)
+make demos     # test binaries, which fail ON PURPOSE
+make cli       # the `aegis` binary (Nim)
+make test      # test suite
 ```
 
-Las demos están separadas de `all` a propósito: son programas que abortan con core
-dump por diseño, y no tiene sentido que `make` los construya por defecto.
+The demos are kept out of `all` deliberately: they are programs that core-dump by
+design, and it makes no sense for `make` to build them by default.
 
-## Uso
+## Usage
 
 ```bash
-# ejecutar un programa bajo Aegis
-./build/bin/aegis run ./mi_programa argumentos...
+# run a program under Aegis
+./build/bin/aegis run ./my_program args...
 
-# como `run`, pero devuelve error (rc=1) si NO hubo ninguna cura.
-# útil en CI: "este test debe lanzar SIGFPE y ser curado".
-./build/bin/aegis heal ./mi_programa
+# like `run`, but exits with an error (rc=1) if NO heal happened.
+# useful in CI: "this test must raise SIGFPE and be healed".
+./build/bin/aegis heal ./my_program
 
-# engancharse a un proceso ya vivo y observar sus traps (solo lectura)
+# attach to an already-running process and observe its traps (read-only)
 ./build/bin/aegis attach <pid>
 ```
 
-También funciona con `LD_PRELOAD` directo, **precargando las dos bibliotecas**
-(el motor sin la otra no cura: son dos bibliotecas, no una):
+It also works with plain `LD_PRELOAD`, **preloading both libraries** (the engine
+heals nothing without the other — these are two libraries, not one):
 
 ```bash
-LD_PRELOAD=build/lib/libaegis_sys.so:build/lib/libaegis_core.so ./mi_programa
+LD_PRELOAD=build/lib/libaegis_sys.so:build/lib/libaegis_core.so ./my_program
 ```
 
 ---
 
-## Verificación
+## Verification
 
-El requisito de diseño era: **probar con programas reales del sistema, no con
-programas inventados para que fallen.** Un programa escrito por nosotros ya sabe
-dónde está su `idiv`, así que no demuestra nada.
+The design requirement was: **test against real system programs, not programs
+invented to fail.** A program we wrote ourselves already knows where its `idiv` is, so
+it proves nothing.
 
-**No-interferencia** — binarios reales del sistema, salida idéntica bit a bit
-(hash SHA-256 de la salida con y sin Aegis):
+**Non-interference** — real system binaries, bit-for-bit identical output (SHA-256 of
+the output with and without Aegis):
 
 ```
-IGUAL   df          IGUAL   awk         IGUAL   python3
-IGUAL   sort        IGUAL   objdump     IGUAL   readelf
-IGUAL   iconv       IGUAL   nm          IGUAL   file
-IGUAL   sqlite3     IGUAL   sha256sum
+MATCH   df          MATCH   awk         MATCH   python3
+MATCH   sort        MATCH   objdump     MATCH   readelf
+MATCH   iconv       MATCH   nm          MATCH   file
+MATCH   sqlite3     MATCH   sha256sum
 ```
 
-**Curación real** — un programa compilado a `-O2` (como el software de producción),
-con el divisor spilled en el stack:
+**Real healing** — a program compiled at `-O2` (like production software), with the
+divisor spilled onto the stack:
 
-| | Sin Aegis | Con Aegis |
+| | Without Aegis | With Aegis |
 |---|---|---|
-| Código de salida | `136` (SIGFPE) | `0` |
-| Resultado | proceso muerto | `total=100` |
+| Exit code | `136` (SIGFPE) | `0` |
+| Result | process dead | `total=100` |
 
-Y el resultado numérico es el correcto, no un número fijo:
-`76543 / 0 → 76543` (con el divisor reparado a 1, el cociente es el dividendo).
-Cuando el divisor es válido no se toca nada: `100 / 5 → 20`.
+And the numeric result is correct, not a fixed number: `76543 / 0 → 76543` (with the
+divisor repaired to 1, the quotient is the dividend). When the divisor is valid
+nothing is touched: `100 / 5 → 20`.
 
-**Resultado negativo honesto.** Se intentó encontrar fallos naturales haciendo
-fuzzing (3000 rondas de mutación) sobre parsers reales (`djpeg`, `ffprobe`,
-`ImageMagick`, `objdump`, `readelf`, `xz`, `7z`) con archivos del sistema
-degradados. **0 crashes**: los binarios de 2025–26 están endurecidos contra
-entrada malformada trivial. Se documenta porque el resultado negativo es
-información, y porque confirma que el arnés de prueba funcionaba.
+**An honest negative result.** We tried to find natural faults by fuzzing (3000
+mutation rounds) against real parsers (`djpeg`, `ffprobe`, `ImageMagick`, `objdump`,
+`readelf`, `xz`, `7z`) using degraded system files. **0 crashes**: 2025–26 binaries are
+hardened against trivially malformed input. This is documented because a negative
+result is information, and because it confirms the test harness actually worked.
 
 ---
 
-## Estructura
+## Layout
 
 ```
 ├── Makefile
-├── aegis_injector/aegis_injector.nim   # CLI (Nim): run / attach
-├── aegis_sys/                         # C23 + ASM: handler de señal
-│   ├── include/aegis_api.h            # contrato FFI (+ asserts de layout)
+├── aegis_injector/aegis_injector.nim   # CLI (Nim): run / heal / attach
+├── aegis_sys/                         # C23 + ASM: signal handler
+│   ├── include/aegis_api.h            # FFI contract (+ layout asserts)
 │   └── src/{trap_handler,addrspace,mman_utils,capdisasm}.c
 ├── aegis_core/src/*.rs                # Rust no_std: fastpath, engine, signature
-├── tests/demos/*.c                    # binarios con fallos intencionales
+├── tests/demos/*.c                    # binaries with intentional faults
 ├── scripts/{run_demos,bench_overhead}.sh
-└── docs/ARCHITECTURE.md               # decisiones y bitácora de deuda técnica
+└── docs/ARCHITECTURE.md               # design decisions and technical-debt log
 ```
 
-`docs/ARCHITECTURE.md` tiene el detalle completo: por qué cada lenguaje está donde
-está, el contrato FFI, y una bitácora de los **bugs que se encontraron y
-corrigieron** (incluidos los que estaban en el código antes de que llegara a
-compilar).
+`docs/ARCHITECTURE.md` has the full detail: why each language is where it is, the FFI
+contract, and a log of the **bugs that were found and fixed** (including the ones that
+were in the code before it ever compiled).
 
-## Rendimiento
+## Performance
 
-Medido sobre sqlite3, bash, python3 y git (mediana, `scripts/bench_overhead.sh`):
+Measured on sqlite3, bash, python3 and git (median, `scripts/bench_overhead.sh`):
 
-- **Arranque** (procesos mínimos): +0.5–0.6 ms fijos.
-- **Estado estable** (workloads de cientos de ms): **+0.02% a +3.5%**, típico 1%.
+- **Startup** (minimal processes): +0.5–0.6 ms fixed.
+- **Steady state** (workloads of hundreds of ms): **+0.02% to +3.5%**, typically 1%.
 
-## Estado
+## Status
 
-Fase 1 (núcleo) completa y verificada end-to-end. La fase 2 (parche JIT con
-trampolines y shadow page) está preparada en la estructura pero inactiva.
+Phase 1 (core) complete and verified end-to-end. Phase 2 (JIT patching with
+trampolines and shadow page) is present in the structure but inactive.
 
-## Advertencia
+## Warning
 
-Esto es una herramienta de diagnóstico y resiliencia. Repara fallos para que
-puedas inspeccionar el estado del proceso; **no** convierte un programa con
-memoria corrupta en uno correcto. Usar `PatchMem` cambia el resultado del cálculo:
-para una app de producción es una decisión, no un efecto gratis.
+This is a diagnostic and resilience tool. It repairs faults so you can inspect the
+process state; it does **not** turn a program with corrupted memory into a correct
+one. Using `PatchMem` changes the result of the computation: for a production app
+that is a decision, not a free side effect.
 
-## Licencia
+## License
 
 MIT.

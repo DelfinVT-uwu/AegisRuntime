@@ -158,28 +158,28 @@ proc ruleName(r: int): string =
   ## Traduce `patch_id` de engine.rs.
   case r
   of 1: "div-zero (divisor=1)"
-  of 2: "div-mem: forma no resoluble (skip)"
+  of 2: "div-mem: unresolvable form (skip)"
   of 3: "skip null-deref"
   of 4: "skip invalid-access"
-  of 5: "abort: firma recurrente"
-  of 6: "abort: señal no soportada"
-  of 7: "abort: SIGFPE no-DIV"
-  of 8: "abort: no decodificable"
-  of 9: "abort: RIP ilegible"
-  of 10: "div-mem: divisor forzado a 1 en RAM + re-ejecucion"
-  of 11: "degradado a skip: pagina no escribible"
-  of 12: "ignorado: tamano de parche invalido"
+  of 5: "abort: recurring signature"
+  of 6: "abort: unsupported signal"
+  of 7: "abort: SIGFPE non-DIV"
+  of 8: "abort: undecodable"
+  of 9: "abort: RIP unreadable"
+  of 10: "div-mem: divisor forced to 1 in RAM + re-execution"
+  of 11: "degraded to skip: page not writable"
+  of 12: "ignored: invalid patch size"
   else: "?"
 
 proc summarize(r: Report): string =
-  ## Informe legible: qué se curó, qué no, y qué haría al respecto.
+  ## Human-readable report: what was healed, what was not, and what to do about it.
   result = ""
   if r.healed > 0:
-    result.add("  curados  : " & $r.healed & " evento(s)\n")
+    result.add("  healed  : " & $r.healed & " event(s)\n")
   if r.fatal > 0:
-    result.add("  fatales  : " & $r.fatal & " evento(s) sin remedio\n")
+    result.add("  fatal   : " & $r.fatal & " event(s) with no remedy\n")
   if r.traps.len == 0:
-    result.add("  (sin traps registrados)\n")
+    result.add("  (no traps recorded)\n")
     return
   result.add("  " & repeat("-", 68) & "\n")
   for t in r.traps:
@@ -225,7 +225,7 @@ proc runAegis(cmd: string, args: openArray[string]): RunResult =
   let preload = root / libAegisSys & ":" & root / libAegisCore
 
   if not fileExists(root / libAegisSys):
-    stderr.writeLine("aegis: falta " & (root / libAegisSys) & " (ejecuta `make`)")
+    stderr.writeLine("aegis: missing " & (root / libAegisSys) & " (run `make`)")
     quit(2)
 
   # Nim 2.x exige un StringTableRef para `env`, no una seq: el proceso hijo
@@ -309,9 +309,9 @@ proc attachObserve(pid: cint): int =
     # restricción de seguridad de otro proceso sería la peor decisión posible
     # en una herramienta de resiliencia.
     if e == EPERM:
-      stderr.writeLine("  causa probable: Yama. `cat /proc/sys/kernel/yama/ptrace_scope`")
-      stderr.writeLine("  ptrace_scope=1 restringe el attach a descendientes del supervisor.")
-      stderr.writeLine("  para el supervisor hace falta CAP_SYS_PTRACE, o ptrace_scope=0 en el host.")
+      stderr.writeLine("  probable cause: Yama. `cat /proc/sys/kernel/yama/ptrace_scope`")
+      stderr.writeLine("  ptrace_scope=1 restricts attach to descendants of the supervisor.")
+      stderr.writeLine("  the supervisor needs CAP_SYS_PTRACE, or ptrace_scope=0 on the host.")
     return 2
 
   var status: cint = 0
@@ -342,23 +342,23 @@ proc attachObserve(pid: cint): int =
 # ---------------------------------------------------------------------------
 
 const usage = """
-aegis — runtime de resiliencia para procesos nativos
+aegis — resilience runtime for native processes
 
-USO:
-  aegis run    <cmd> [args...]   ejecuta <cmd> con el runtime y muestra la
-                                  telemetría de cada trap curado
-  aegis heal   <cmd> [args...]   como `run`, pero el código de salida es 0
-                                  solo si el runtime curó AL MENOS un fallo
-                                  y el proceso terminó bien. Útil en CI.
-  aegis attach <pid>             observa (sin reparar) un proceso existente
+USAGE:
+  aegis run    <cmd> [args...]   run <cmd> with the runtime and show the
+                                  telemetry of every healed trap
+  aegis heal   <cmd> [args...]   like `run`, but the exit code is 0 only if
+                                  the runtime healed AT LEAST one fault AND
+                                  the process exited cleanly. Useful in CI.
+  aegis attach <pid>             observe (without repairing) a running process
 
-EJEMPLOS:
-  aegis run   ./mi_app 10/0        # la app tiene un divisor cero
-  aegis heal  ./mi_app datos.csv   # CI: falla si la app crashea sin curar
+EXAMPLES:
+  aegis run   ./my_app 100 0       # the app has a zero divisor
+  aegis heal  ./my_app data.csv    # CI: fails if the app crashes unhealed
   aegis attach 12345
 
-DEPENDENCIAS: make (compila build/lib/*.so). Aegis usa LD_PRELOAD, así que
-no necesita recompilar la app objetivo.
+DEPENDENCIES: make (builds build/lib/*.so). Aegis uses LD_PRELOAD, so the
+target app does not need to be recompiled.
 """
 
 proc main() =
@@ -372,32 +372,32 @@ proc main() =
 
   case mode
   of "run":
-    if rest.len == 0: quit("aegis run: falta el comando", 2)
+    if rest.len == 0: quit("aegis run: missing command", 2)
     let r = runAegis(rest[0], rest[1..^1])
     echo ""
-    echo "── informe ──────────────────────────────────────────────"
+    echo "── report ───────────────────────────────────────────────"
     echo summarize(r.report)
     if r.exitCode != 0:
-      echo &"  proceso terminó con exit={r.exitCode}"
+      echo &"  process exited with exit={r.exitCode}"
     quit(if r.report.fatal > 0: 1 else: r.exitCode)
 
   of "heal":
-    if rest.len == 0: quit("aegis heal: falta el comando", 2)
+    if rest.len == 0: quit("aegis heal: missing command", 2)
     let r = runAegis(rest[0], rest[1..^1])
     echo ""
-    echo "── informe (modo heal) ─────────────────────────────────"
+    echo "── report (heal mode) ──────────────────────────────────"
     echo summarize(r.report)
-    # Éxito = el proceso sobrevivió Y hubo al menos una cura real.
+    # Success = the process survived AND at least one real heal happened.
     let ok = r.exitCode == 0 and r.report.healed > 0 and r.report.fatal == 0
-    echo(if ok: "  RESULTADO: curado" else: "  RESULTADO: no curado")
+    echo(if ok: "  RESULT: healed" else: "  RESULT: not healed")
     quit(if ok: 0 else: 1)
 
   of "attach":
-    if rest.len != 1: quit("aegis attach: se espera exactamente un pid", 2)
+    if rest.len != 1: quit("aegis attach: expected exactly one pid", 2)
     try:
       quit(attachObserve(parseInt(rest[0]).cint))
     except ValueError:
-      quit("aegis attach: pid no numérico", 2)
+      quit("aegis attach: pid is not numeric", 2)
 
   else:
     stderr.writeLine("aegis: subcomando desconocido '" & mode & "'")
