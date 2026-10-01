@@ -9,16 +9,24 @@ AegisRuntime is injected into the process via `LD_PRELOAD`, intercepts the signa
 resumes execution.
 
 ```console
-$ ./build/bin/aegis run ./realmem3 100 0
-total=100
+$ ./build/bin/divmem; echo "exit=$?"
+Floating point exception (core dumped)
+exit=136                      # 128 + 8 = SIGFPE
+
+$ ./build/bin/aegis run ./build/bin/divmem
+resultado = 200
 
 ── report ───────────────────────────────────────────────
   healed  : 1 event(s)
   --------------------------------------------------------------------
-  SIGFPE   rip=0x561f0c1031f1 action=patchmem rule=div-mem: divisor forced to 1 in RAM + re-execution
+  SIGFPE   rip=0x55cd11d3b174 action=patchmem rule=div-mem: divisor forced to 1 in RAM + re-execution
 ```
 
-Without Aegis, that same program died with `rc=136` (128 + 8 = SIGFPE).
+That is `tests/demos/divmem.c`, included in the repo: `200 / 0` where the divisor
+lives in a `volatile` array, so it is compiled as a memory operand
+(`idivq 0x8(%rdi)`) rather than a register. Without Aegis it dies with `rc=136`;
+with Aegis it returns `200` (the divisor is repaired to 1, so the quotient is the
+dividend). Try it yourself after `make demos`.
 
 ---
 
@@ -67,10 +75,13 @@ CPU fault → kernel → sigaltstack → aegis_trap_handler (C23)
 
 **1. The engine never touches memory. It neither dereferences nor reads it.**
 C copies the legible prefix of the instruction (up to 15 bytes, or up to the end of
-the page) and Rust decodes **on that copy**. Rust therefore has not a single `unsafe`
-memory access — which is exactly where you don't want to be inside a signal handler.
-Before this, the engine used `slice::from_raw_parts(rip, 15)` and would hang by itself
-when RIP was unreadable.
+the page) and Rust decodes **on that copy**. So the decoding and decision logic —
+`fastpath.rs`, `engine.rs`, `signature.rs` — contain **zero** `unsafe` and zero
+pointer dereferences. The only `unsafe` in the crate is the FFI boundary itself
+(converting the caller's raw pointers into references) and the tests, which is
+exactly where a compiler should force you to state the contract.
+Before this, the engine did `slice::from_raw_parts(rip, 15)` and would hang by
+itself when RIP was unreadable — a signal handler deadlocking inside itself.
 
 **2. Separating "compute the address" from "write to it".**
 Rust returns a `MemWrite { addr, val, size }`: Rust **computes** the address, C
@@ -85,8 +96,8 @@ The Nim injector does not reimplement the heuristic: there is a single source of
 ### The `PatchMem` cure: the divisor lives in RAM
 
 This is the hard case and the most common one in software compiled at `-O2`. GCC
-optimizes the divisor into a **stack spill**, so the instruction that faults looks
-like `idivq -0x8(%rsp)` — the divisor **is not in any register**, it's in memory.
+spills the operands to the stack, so the instruction that faults is something like
+`idivq 0x8(%rsp)` — the divisor **is not in any register**, it is in memory.
 There is no register to patch.
 
 Aegis then:
@@ -96,11 +107,16 @@ Aegis then:
 3. Writes `1` at that memory location.
 4. **Re-executes** the same instruction → the quotient comes out correct.
 
+```console
+$ objdump -d build/bin/divmem | grep -B2 idiv
+    116e:	48 8b 04 24          	mov    (%rsp),%rax     # dividend: also spilled
+    1172:	48 99                	cqto                   # sign-extend RAX -> RDX:RAX
+    1174:	48 f7 7c 24 08       	idivq  0x8(%rsp)       # divisor: an ADDRESS, not a register
 ```
-real idiv at offset 0x11f1  ->  48 f7 7c 24 f8   idivq  -0x8(%rsp)
-divisor effective address = 0x7fffffffe390
-divisor value IN MEMORY   = 0   <-- zero => #DE
-```
+
+Note the operand: `0x8(%rsp)`. Both operands are in memory, and there is no
+register anywhere to patch — that is exactly why a register-only cure is not
+enough.
 
 ### Safety
 
@@ -174,17 +190,27 @@ divisor spilled onto the stack:
 | | Without Aegis | With Aegis |
 |---|---|---|
 | Exit code | `136` (SIGFPE) | `0` |
-| Result | process dead | `total=100` |
+| Result | process dead | `resultado = 200` |
 
-And the numeric result is correct, not a fixed number: `76543 / 0 → 76543` (with the
-divisor repaired to 1, the quotient is the dividend). When the divisor is valid
-nothing is touched: `100 / 5 → 20`.
+And the numeric result is correct, not a fixed number: `200 / 0 → 200` (with the
+divisor repaired to 1, the quotient is the dividend). This is the check that matters:
+if the engine merely *skipped* the instruction, the process would also survive but
+`resultado` would be garbage — healed in appearance, broken in reality.
 
-**An honest negative result.** We tried to find natural faults by fuzzing (3000
-mutation rounds) against real parsers (`djpeg`, `ffprobe`, `ImageMagick`, `objdump`,
-`readelf`, `xz`, `7z`) using degraded system files. **0 crashes**: 2025–26 binaries are
-hardened against trivially malformed input. This is documented because a negative
-result is information, and because it confirms the test harness actually worked.
+**An honest negative result.** We tried to find natural faults by fuzzing against
+real parsers — `djpeg`, `ffprobe`, `ImageMagick`, `objdump`, `readelf`, `xz`, `7z` —
+using degraded system files. **0 crashes** in 3000 mutation rounds: 2025–26 binaries
+are hardened against trivially malformed input.
+
+This is reproducible — the harness is in the repo:
+
+```bash
+python3 scripts/fuzz_real_parsers.py 3000
+```
+
+It is documented because a negative result is information, and because the harness
+having found nothing is itself the check that it worked. If it reports crashes on
+your machine, that is real data about your versions of those binaries.
 
 ---
 
@@ -198,8 +224,9 @@ result is information, and because it confirms the test harness actually worked.
 │   └── src/{trap_handler,addrspace,mman_utils,capdisasm}.c
 ├── aegis_core/src/*.rs                # Rust no_std: fastpath, engine, signature
 ├── tests/demos/*.c                    # binaries with intentional faults
-├── scripts/{run_demos,bench_overhead}.sh
-└── docs/ARCHITECTURE.md               # design decisions and technical-debt log
+├── scripts/run_demos.sh               # control vs. runtime, per demo
+├── scripts/bench_overhead.sh          # startup + steady-state overhead
+└── scripts/fuzz_real_parsers.py       # hunts natural faults in real parsers
 ```
 
 `docs/ARCHITECTURE.md` has the full detail: why each language is where it is, the FFI
@@ -208,10 +235,33 @@ were in the code before it ever compiled).
 
 ## Performance
 
-Measured on sqlite3, bash, python3 and git (median, `scripts/bench_overhead.sh`):
+Measured with `scripts/bench_overhead.sh` (median of 9 runs + 2 warmup), on real
+installed binaries — no fixture is used here either:
 
-- **Startup** (minimal processes): +0.5–0.6 ms fixed.
-- **Steady state** (workloads of hundreds of ms): **+0.02% to +3.5%**, typically 1%.
+**Startup** — the fixed price of paying `ld.so` plus Aegis' constructor:
+
+| Workload | Without | With | Overhead |
+|---|---|---|---|
+| `/bin/true` | 1.31 ms | 2.01 ms | **+0.70 ms** |
+| `bash -c :` | 2.05 ms | 2.62 ms | **+0.57 ms** |
+| `sqlite3 :memory:` (empty) | 2.06 ms | 2.59 ms | **+0.53 ms** |
+
+**Steady state** — the runtime while the process actually works. With no traps the
+signal handler never runs, so this is pure overhead:
+
+| Workload | Without | With | Overhead |
+|---|---|---|---|
+| `bash`: 2M arithmetic ops | 2820 ms | 2839 ms | +18.7 ms (**+0.66%**) |
+| `python3`: 10M iterations | 537 ms | 541 ms | +4.4 ms (**+0.81%**) |
+
+Two caveats, stated plainly:
+
+- Percentages lie when the denominator is small. On the short sqlite3 workloads the
+  numbers swing between −4% and +28% run to run, because ~10 ms is too little time to
+  measure against. The milliseconds, not the percentage, are the real measurement.
+- Startup overhead is **irreducible in the current design**: it is paid on every
+  process start. A service running for hours amortizes it to nothing; a 1 ms script
+  notices it. That is a property of preloading, not a tuning bug.
 
 ## Status
 

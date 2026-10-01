@@ -19,9 +19,12 @@
 # algo que dura 1 ms.
 #
 # [METODOLOGÍA]
-# Ningún workload es un fixture escrito para esto: son sqlite3, bash, git y
-# python3, programas que ya estaban instalados. Los workloads de (b) duran
-# cientos de ms para que el coste de arranque sea ruido.
+# Ningún workload es un fixture escrito para esto: son /bin/true, bash, sqlite3 y
+# python3, programas que ya estaban instalados. (Un comentario anterior de este
+# fichero decía "sqlite3, bash, git y python3", pero git no aparece en ningún
+# workload de aquí: se quitó para no arrastrar un repositorio temporal y nadie
+# actualizó la nota. Los números del README se midieron con esta lista.)
+# Los workloads de (b) duran cientos de ms para que el coste de arranque sea ruido.
 # Se reporta la MEDIANA de N repeticiones, no el mínimo: en procesos de
 # milisegundos el mínimo lo elige siempre el lucky scheduling del kernel y
 # exagera las diferencias. Se descartan además las primeras 2 ejecuciones
