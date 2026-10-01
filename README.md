@@ -278,3 +278,17 @@ that is a decision, not a free side effect.
 ## License
 
 MIT.
+
+## Contributing & Issues
+
+If you find a bug, please [open an issue](https://github.com/DelfinVT-uwu/AegisRuntime/issues)
+and include:
+
+- The exact command you ran
+- The output (with `AEGIS_LOG=1` if relevant)
+- Your OS/architecture, compiler versions (`gcc --version`, `cargo --version`, `nim --version`)
+- A minimal reproducer if possible
+
+Suggestions are welcome. Pull requests are accepted if they keep the safety
+guarantees (fail-closed) and don't introduce `unsafe` outside the FFI boundary.
+For design changes, it's best to start with an issue first.
